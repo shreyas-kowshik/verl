@@ -35,6 +35,8 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+import ray.util.rpdb as ray_pdb
+
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -969,6 +971,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+
+        # breakpoint()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -981,6 +986,8 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+
+        # breakpoint()
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1020,6 +1027,8 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
 
+                # ray_pdb.set_trace()
+
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1027,6 +1036,8 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                ray_pdb.set_trace()
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(

@@ -239,6 +239,8 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        # breakpoint()
+
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
