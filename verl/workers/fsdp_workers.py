@@ -181,11 +181,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_lora = self._lora_rank > 0
 
         self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+        # breakpoint()
+        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref", "example_actor", "solution_actor"], f"Invalid role {self.role}, should be one of ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref', 'example_actor', 'solution_actor']"
 
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref", "example_actor", "solution_actor"]
+        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref", "example_actor", "solution_actor"]
+        self._is_ref = self.role in ["ref", "actor_rollout_ref", "example_actor"]
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
 
         # TODO(haibin.lin):

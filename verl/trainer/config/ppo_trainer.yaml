@@ -24,6 +24,12 @@ defaults:
   # Model config.
   - model@actor_rollout_ref.model: hf_model
 
+  # Two player example actor defaults reuse the same base configs
+  - actor@two_player.example_actor_rollout_ref.actor: dp_actor
+  - ref@two_player.example_actor_rollout_ref.ref: dp_ref
+  - rollout@two_player.example_actor_rollout_ref.rollout: rollout
+  - model@two_player.example_actor_rollout_ref.model: hf_model
+
   # Critic model config.
   - critic@critic: dp_critic
 
@@ -328,3 +334,38 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# two-player training configuration
+two_player:
+
+  # Whether to enable two-player (example + solution) training
+  enable: false
+
+  # Default pool names for example and solution actors
+  example_actor_pool_name: example_actor_pool
+
+  solution_actor_pool_name: solution_actor_pool
+
+  # Default resource allocation for the example actor
+  example_actor_pool:
+
+    n_gpus_per_node: 1
+
+    nnodes: 1
+
+  # Default resource allocation for the solution actor
+  solution_actor_pool:
+
+    n_gpus_per_node: 1
+
+    nnodes: 1
+
+  # Example actor rollout/reference configuration
+  example_actor_rollout_ref:
+
+    # Force synchronous single-sample rollout for examples
+    rollout:
+
+      mode: sync
+
+      n: 1

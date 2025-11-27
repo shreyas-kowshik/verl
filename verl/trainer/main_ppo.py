@@ -22,6 +22,8 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+import ray.util.rpdb as ray_pdb
+
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -106,39 +108,62 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+        self.two_player_cfg = None
+        self.two_player_enabled = False
 
-    def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker based on the actor strategy."""
+    def _load_actor_worker_impl(self, actor_cfg):
+        """Resolve the worker implementation for a given actor config."""
         from verl.single_controller.ray import RayWorkerGroup
-
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+        
+        if actor_cfg.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
 
             actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
+                AsyncActorRolloutRefWorker if actor_cfg.rollout.mode == "async" else ActorRolloutRefWorker
             )
             ray_worker_group_cls = RayWorkerGroup
 
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
+        elif actor_cfg.actor.strategy == "megatron":
             from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
 
             actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
+                AsyncActorRolloutRefWorker if actor_cfg.rollout.mode == "async" else ActorRolloutRefWorker
             )
             ray_worker_group_cls = RayWorkerGroup
 
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported actor strategy: {actor_cfg.actor.strategy}")
 
+        return actor_rollout_cls, ray_worker_group_cls
+
+    def add_actor_rollout_worker(self, config):
+        """Add actor rollout worker based on the actor strategy."""
+        actor_rollout_cls, ray_worker_group_cls = self._load_actor_worker_impl(config.actor_rollout_ref)
         from verl.trainer.ppo.ray_trainer import Role
 
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
+
+    def add_two_player_actor_workers(self, config):
+        """Register both example and solution actor workers."""
+        if config.two_player is None or config.two_player.example_actor_rollout_ref is None:
+            raise ValueError("two_player.example_actor_rollout_ref must be provided for two-player mode.")
+
+        example_cfg = config.two_player.example_actor_rollout_ref
+        example_cls, example_wg_cls = self._load_actor_worker_impl(example_cfg)
+
+        solution_cls, solution_wg_cls = self._load_actor_worker_impl(config.actor_rollout_ref)
+
+        if example_wg_cls is not solution_wg_cls:
+            raise ValueError("Example and solution actors must use the same RayWorkerGroup implementation.")
+
+        from verl.trainer.ppo.ray_trainer import Role
+
+        self.role_worker_mapping[Role.ExampleActor] = ray.remote(example_cls)
+        self.role_worker_mapping[Role.ActorRollout] = ray.remote(solution_cls)
+
+        return solution_cls, solution_wg_cls
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
@@ -165,11 +190,21 @@ class TaskRunner:
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
+        # COMMENT: Intuitively this specifies how many resources a particular role needs and assigns this mapping
         from verl.trainer.ppo.ray_trainer import Role
 
         global_pool_id = "global_pool"
+        trainer_cfg = config.trainer
+
+        def _build_pool_spec(pool_cfg):
+            if pool_cfg is None:
+                return [trainer_cfg.n_gpus_per_node] * trainer_cfg.nnodes
+            n_gpus = pool_cfg.get("n_gpus_per_node", trainer_cfg.n_gpus_per_node)
+            nnodes = pool_cfg.get("nnodes", trainer_cfg.nnodes)
+            return [n_gpus] * nnodes
+
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            global_pool_id: [trainer_cfg.n_gpus_per_node] * trainer_cfg.nnodes,
         }
         # TODO Here you can use the new registration method to support dynamic registration of roles
         if config.reward_model.enable_resource_pool:
@@ -181,7 +216,28 @@ class TaskRunner:
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
 
-        self.mapping[Role.ActorRollout] = global_pool_id
+        two_player_pool_cfg = trainer_cfg.get("two_player", None)
+        if self.two_player_enabled:
+            if two_player_pool_cfg is None:
+                raise ValueError("trainer.two_player must be configured when two-player mode is enabled.")
+            example_pool_name = two_player_pool_cfg.get("example_actor_pool_name", "example_actor_pool")
+            solution_pool_name = two_player_pool_cfg.get("solution_actor_pool_name", "solution_actor_pool")
+
+            # TODO: Play around with this #
+            resource_pool_spec[example_pool_name] = _build_pool_spec(
+                two_player_pool_cfg.get("example_actor_pool") if two_player_pool_cfg else None
+            )
+            # resource_pool_spec[solution_pool_name] = _build_pool_spec(
+            #     two_player_pool_cfg.get("solution_actor_pool") if two_player_pool_cfg else None
+            # )
+
+            self.mapping[Role.ExampleActor] = example_pool_name
+            # self.mapping[Role.ActorRollout] = solution_pool_name
+            # Mapping both example and solution generator to global pool #
+            # self.mapping[Role.ExampleActor] = global_pool_id
+            self.mapping[Role.ActorRollout] = global_pool_id
+        else:
+            self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
@@ -245,7 +301,13 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        self.two_player_cfg = OmegaConf.select(config, "trainer.two_player")
+        self.two_player_enabled = bool(self.two_player_cfg and self.two_player_cfg.get("enable", False))
+
+        if self.two_player_enabled:
+            actor_rollout_cls, ray_worker_group_cls = self.add_two_player_actor_workers(config)
+        else:
+            actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
         # We should adopt a multi-source reward function here:
@@ -280,6 +342,14 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        example_tokenizer = None
+        if self.two_player_enabled:
+            example_model_cfg = config.two_player.example_actor_rollout_ref.model
+            example_local_path = copy_to_local(
+                example_model_cfg.path, use_shm=example_model_cfg.get("use_shm", False)
+            )
+            example_tokenizer = hf_tokenizer(example_local_path, trust_remote_code=trust_remote_code)
+
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
@@ -301,6 +371,7 @@ class TaskRunner:
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
+            example_tokenizer=example_tokenizer,
             processor=processor,
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,

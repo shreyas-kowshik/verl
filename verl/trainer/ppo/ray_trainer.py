@@ -261,6 +261,22 @@ def compute_advantage(
         data.batch["returns"] = returns
     return data
 
+EXAMPLE_GENERATOR_PROMPT_TEMPLATE = """Given the following problem statement:
+{problem_statement}
+
+Generate a clear and complete solved example for this problem.
+	•	Do not write any code.
+	•	Choose simple toy values to illustrate the process.
+	•	Show the step-by-step reasoning used to solve the example.
+	•	Clearly present the initial input, intermediate steps, and final output.
+	•	Format the solution neatly using bullet points or equations where appropriate.
+
+Structure your response with the following sections:
+	1.	Problem Recap
+	2.	Example Input
+	3.	Step-by-Step Solution
+	4.	Final Answer
+"""
 
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
@@ -286,6 +302,7 @@ class RayPPOTrainer:
         val_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
+        example_tokenizer=None,
         device_name=None,
     ):
         """
@@ -310,6 +327,7 @@ class RayPPOTrainer:
 
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
+        self.example_tokenizer = example_tokenizer if example_tokenizer is not None else tokenizer
         self.processor = processor
         self.config = config
         self.reward_fn = reward_fn
@@ -335,6 +353,33 @@ class RayPPOTrainer:
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+
+        self.two_player_cfg = OmegaConf.select(self.config.trainer, "two_player")
+        self.two_player_enabled = bool(self.two_player_cfg and self.two_player_cfg.get("enable", False))
+        self.example_actor_cfg = None
+        self.solution_prompt_template = None
+        self.solution_prompt_max_length = None
+        self.shared_reward_pass_key = None
+        self.example_actor_wg = None
+        self.solution_actor_wg = None
+
+        if self.two_player_enabled:
+            self.default_prompt_template_two_player = "You are a helpful Python coding assistant.\nGiven a task, output ONLY valid Python code that defines the required function(s).\nDo not include explanations or markdown fences.\nDo not include any docstrings or anything other than the python function(s).\nEnclose the entire solution within ```python and ```.\n\n{problem}\n\nConstraints:\n- Write clean, minimal Python and no other language.\n- Define the function(s) exactly as implied by the tests.\n- Do NOT print; just return values.\n- Output ONLY code (no backticks, no explanations).\n- Enclose the entire solution within ```python and ```.\n\n\nTo aid you in solving the problem, here is(are) step by step solved examples to illustrate how to solve the problem\n\n\n\n\n\n{example}\n\n"
+            example_cfg = OmegaConf.select(self.config, "two_player.example_actor_rollout_ref")
+            if example_cfg is None:
+                raise ValueError("two_player.example_actor_rollout_ref must be provided for two-player training.")
+            self.example_actor_cfg = example_cfg
+            self.solution_prompt_template = self.two_player_cfg.get(
+                "prompt_template",
+                # "Problem:\n{problem}\n\nWorked Example:\n{example}\n\nNow provide the final solution:\n",
+                self.default_prompt_template_two_player,
+            )
+            self.solution_prompt_max_length = self.two_player_cfg.get("solution_prompt_max_length", None)
+            self.shared_reward_pass_key = self.two_player_cfg.get("reward_pass_key", "all_tests_passed")
+            if self.config.actor_rollout_ref.rollout.mode == "async" or self.example_actor_cfg.rollout.mode == "async":
+                raise NotImplementedError("Two-player mode currently supports only synchronous rollouts.")
+            # if self.example_actor_cfg.rollout.n != 1:
+            #     raise NotImplementedError("Example actor rollout.n must be 1 for two-player mode.")
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -539,9 +584,8 @@ class RayPPOTrainer:
                 )
 
             # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
+            repeat_times = self.config.actor_rollout_ref.rollout.val_kwargs.n
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
@@ -559,7 +603,31 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
-            test_gen_batch = self._get_gen_batch(test_batch)
+            example_texts = None
+            if self.two_player_enabled:
+                example_batch = deepcopy(test_batch)
+                example_gen_batch = self._get_gen_batch(example_batch)
+                example_gen_batch.meta_info = {
+                    "eos_token_id": self.example_tokenizer.eos_token_id,
+                    "pad_token_id": self.example_tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
+                example_output = self.example_actor_wg.generate_sequences(example_gen_batch)
+                example_texts = self.example_tokenizer.batch_decode(
+                    example_output.batch["responses"], skip_special_tokens=True
+                )
+
+            if self.two_player_enabled:
+                test_gen_batch = self._prepare_solution_generation_batch(
+                    batch=test_batch,
+                    example_texts=example_texts,
+                    problem_texts=input_texts,
+                )
+            else:
+                test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -661,6 +729,101 @@ class RayPPOTrainer:
 
         return metric_dict
 
+    def _init_two_player_workers(self):
+        """Initialize worker groups when running in two-player mode."""
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        if Role.ExampleActor not in self.role_worker_mapping:
+            raise ValueError("Role.ExampleActor missing from role_worker_mapping.")
+
+        example_pool = self.resource_pool_manager.get_resource_pool(Role.ExampleActor)
+        example_actor_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.ExampleActor],
+            config=self.example_actor_cfg,
+            role="example_actor",
+        )
+        self.resource_pool_to_cls[example_pool]["example_actor"] = example_actor_cls
+
+        if self.hybrid_engine:
+            solution_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            solution_actor_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self.config.actor_rollout_ref,
+                role="solution_actor",
+            )
+            self.resource_pool_to_cls[solution_pool]["solution_actor"] = solution_actor_cls
+        else:
+            raise NotImplementedError
+
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role="ref",
+            )
+            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+
+        if self.use_rm:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+
+        all_wg = {}
+        wg_kwargs = {}
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        self.example_actor_wg = all_wg["example_actor"]
+        self.example_actor_wg.init_model()
+
+        self.solution_actor_wg = all_wg["solution_actor"]
+        self.solution_actor_wg.init_model()
+        self.actor_rollout_wg = self.solution_actor_wg
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg.init_model()
+
+        self.rm_wg = None
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+
+        self.async_rollout_mode = False
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -668,6 +831,9 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        if self.two_player_enabled:
+            self._init_two_player_workers()
+            return
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -825,6 +991,22 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+        if self.two_player_enabled and self.example_actor_wg is not None:
+            example_local_path = os.path.join(local_global_step_folder, "example_actor")
+            example_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "example_actor"
+                )
+            )
+            max_keep = self.config.trainer.get(
+                "max_example_actor_ckpt_to_keep", self.config.trainer.get("max_actor_ckpt_to_keep", None)
+            )
+            self.example_actor_wg.save_checkpoint(
+                example_local_path, example_remote_path, self.global_steps, max_ckpt_to_keep=max_keep
+            )
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -867,6 +1049,14 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        if self.two_player_enabled and self.example_actor_wg is not None:
+            example_path = os.path.join(global_step_folder, "example_actor")
+            if os.path.exists(example_path):
+                self.example_actor_wg.load_checkpoint(
+                    example_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+                )
+            else:
+                print(f"Warning: No example actor checkpoint found at {example_path}, continuing without it.")
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -886,6 +1076,8 @@ class RayPPOTrainer:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            if self.two_player_enabled and self.example_actor_wg is not None:
+                self.example_actor_wg.start_profile(role="example", profile_step=self.global_steps)
             if self.use_reference_policy:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
@@ -897,6 +1089,8 @@ class RayPPOTrainer:
         """Stop profiling for all worker groups if profiling is enabled."""
         if do_profile:
             self.actor_rollout_wg.stop_profile()
+            if self.two_player_enabled and self.example_actor_wg is not None:
+                self.example_actor_wg.stop_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
@@ -964,6 +1158,107 @@ class RayPPOTrainer:
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
 
+    def _format_conditioned_prompt(self, problem_text: str, example_text: str) -> str:
+        template = self.solution_prompt_template or (
+            self.default_prompt_template_two_player
+        )
+        return template.format(problem=problem_text, example=example_text)
+
+    def _tokenize_conditioned_prompts(self, prompts: list[str]) -> dict[str, torch.Tensor]:
+        tokenizer_kwargs = {
+            "padding": "longest",
+            "truncation": True,
+            "return_tensors": "pt",
+        }
+        if self.solution_prompt_max_length is not None:
+            tokenizer_kwargs["max_length"] = self.solution_prompt_max_length
+
+        encoded = self.tokenizer(prompts, **tokenizer_kwargs)
+        if "position_ids" not in encoded:
+            seq_len = encoded["input_ids"].shape[1]
+            encoded["position_ids"] = (
+                torch.arange(seq_len).unsqueeze(0).repeat(encoded["input_ids"].shape[0], 1)
+            )
+        return encoded
+    
+    def _format_problem_for_example_generator(self, problem_texts_raw: list[str]) -> list[str]:
+        formatted_prompts = []
+        for problem_text_raw in problem_texts_raw:
+            prompt = EXAMPLE_GENERATOR_PROMPT_TEMPLATE.format(problem_statement=problem_text_raw)
+            formatted_prompts.append(prompt)
+        return formatted_prompts
+
+    @staticmethod
+    def _repeat_texts(texts: list[str], repeat_times: int) -> list[str]:
+        if repeat_times == 1:
+            return texts
+        expanded = []
+        for text in texts:
+            expanded.extend([text] * repeat_times)
+        return expanded
+
+    def _prepare_solution_generation_batch(
+        self, batch: DataProto, example_texts: list[str], problem_texts: list[str]
+    ) -> DataProto:
+        conditioned_prompts = [
+            self._format_conditioned_prompt(problem, example)
+            for problem, example in zip(problem_texts, example_texts, strict=True)
+        ]
+        encoded = self._tokenize_conditioned_prompts(conditioned_prompts)
+        gen_batch = self._get_gen_batch(batch)
+        gen_batch.batch["input_ids"] = encoded["input_ids"]
+        gen_batch.batch["attention_mask"] = encoded["attention_mask"]
+        gen_batch.batch["position_ids"] = encoded["position_ids"]
+        batch.non_tensor_batch["example_generations"] = np.array(example_texts, dtype=object)
+        return gen_batch
+
+    def _binary_reward_from_result(
+        self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict[str, list]
+    ) -> torch.Tensor:
+        batch_size = reward_tensor.shape[0]
+        device = reward_tensor.device
+        dtype = reward_tensor.dtype
+        reward_vector = None
+
+        if reward_extra_infos_dict and self.shared_reward_pass_key in reward_extra_infos_dict:
+            reward_vector = torch.tensor(
+                reward_extra_infos_dict[self.shared_reward_pass_key],
+                dtype=dtype,
+                device=device,
+            )
+
+        if reward_vector is None:
+            reward_vector = (reward_tensor.sum(-1) >= reward_tensor.shape[-1]).to(dtype=dtype, device=device)
+
+        reward_vector = reward_vector.view(batch_size, 1)
+        token_level_rewards = reward_vector.repeat(1, reward_tensor.shape[1])
+        return token_level_rewards
+
+    def _compute_actor_old_log_prob(
+        self,
+        actor_batch: DataProto,
+        actor_wg,
+        actor_cfg,
+        metrics: dict,
+        prefix: str,
+        timing_raw: dict,
+    ) -> DataProto:
+        loss_agg_mode = actor_cfg.actor.loss_agg_mode
+        with marked_timer(f"{prefix}_old_log_prob", timing_raw):
+            old_log_prob = actor_wg.compute_log_prob(actor_batch)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = actor_batch.batch["response_mask"]
+            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+            metrics[f"{prefix}/entropy"] = entropy_agg.detach().item()
+            old_log_prob.batch.pop("entropys", None)
+            actor_batch = actor_batch.union(old_log_prob)
+        return actor_batch
+
+    @staticmethod
+    def _apply_rewards(actor_batch: DataProto, token_level_rewards: torch.Tensor):
+        actor_batch.batch["token_level_scores"] = token_level_rewards.clone()
+        actor_batch.batch["token_level_rewards"] = token_level_rewards.clone()
+
     def fit(self):
         """
         The training loop of PPO.
@@ -971,6 +1266,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self.two_player_enabled:
+            self._fit_two_player()
+            return
 
         # breakpoint()
 
@@ -1027,8 +1325,6 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
 
-                # ray_pdb.set_trace()
-
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1036,8 +1332,12 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-
-                ray_pdb.set_trace()
+                # LOG: Access keys/elements as batch.batch['key']
+                # LOG: Keys as of now `batch.batch.keys()`: _StringKeys(dict_keys(['input_ids', 'attention_mask', 'position_ids']))
+                # LOG: 'input_ids': (B, max_prompt_len), stores token ids for input
+                # LOG: 'position_ids': (B, max_prompt_len), stores position ids for input, padded to left looks like, position for batch example starts from 0 and goes to num_tokens in example prompt
+                # LOG: 'attention_mask': (B, max_prompt_len), here looks like it stores the padding mask
+                # LOG: Other non-tensor keys `batch.non_tensor_batch.keys()`: dict_keys(['data_source', 'reward_model', 'extra_info', 'uid'])
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -1045,10 +1345,14 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
+                # LOG: gen_batch.batch.keys()`: _StringKeys(dict_keys(['input_ids', 'attention_mask', 'position_ids']))
+                # LOG: gen_batch.non_tensor_batch.keys()`: dict_keys(['tools_kwargs', 'raw_prompt_ids', 'interaction_kwargs', 'index', 'examples'])
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                # LOG: Each key in gen_batch will now have shape: (B * rollout_n, max_prompt_len)
+                # LOG: gen_batch has all relevant keys needed for generation and reward computation
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1058,9 +1362,36 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        
+                        # LOG #
+                        # self.actor_rollout_wg.generate_sequences output format #
+                        """Generate sequences for a batch of prompts.
+
+                        Args:
+                            batch (DataProto): Input batch.
+
+                        Returns:
+                            DataProto: Output batch.
+                            - prompts: [bsz, prompt_length], prompt token ids from dataset.
+                            - responses: [bsz, response_length], output token ids include response tokens
+                            from LLM generation and observation tokens from tool_calls.
+                            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
+                            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
+                            and response tokens.
+                            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
+                            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
+
+                            For multi-turn conversations:
+                            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
+                            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
+                        """
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+
+                    # LOG: gen_batch_output.batch.keys()`: _StringKeys(dict_keys(['prompts', 'responses', 'input_ids', 'attention_mask', 'position_ids']))
+                    # LOG: gen_batch_output['responses']: (B * rollout_n, max_response_len) # <EOS> token repeated towards right if response length is smaller than `max_response_len`
+                    # LOG: dict_keys(['tools_kwargs', 'interaction_kwargs', 'index', 'examples'])
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1085,6 +1416,8 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    # LOG: Add back the popped keys when doing `_get_gen_batch(batch)`, includes reward model keys
+                    # LOG: These were only removed to give relevant keys to `generate_sequences`
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1109,8 +1442,12 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    
+                    # LOG: `reward_tensor`: (B * rollout_n, max_response_len), for coding, stores 0/1 rewards for each token in response
+                    # LOG: `reward_extra_infos_dict`: Empty dict for now, if non-empty, the keys are later added to batch and used in next set of computations (TODO: Check how keys are used)
 
                     # recompute old_log_probs
+                    # LOG: This is done for PPO update
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1127,7 +1464,9 @@ class RayPPOTrainer:
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
                             metrics.update(calculate_debug_metrics(batch))
+                    # LOG: `old_log_prob.batch['old_log_probs']`: (B * rollout_n, max_response_len), stores log_probs for each token in response at current set of model parameters
 
+                    # LOG: This is done for the kl_divergence loss/penalty (can also use it in reward)
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -1192,6 +1531,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    # LOG: If critic warmup is enabled, update critic for certain steps before updating actor, done to improve reliability of critic before updating actor parameters
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1296,4 +1636,336 @@ class RayPPOTrainer:
                 # in favor of a general-purpose data buffer pool
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
+                    self.train_dataset.on_batch_end(batch=batch)
+
+    def _fit_two_player(self):
+        """
+        Training loop coordinating example and solution actors with shared rewards.
+        """
+        from omegaconf import OmegaConf
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+
+        # ray_pdb.set_trace()
+
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            if val_metrics:
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get("val_only", False):
+                    return
+
+        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
+            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+            rollout_skip.wrap_generate_sequences()
+
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics = {}
+                timing_raw = {}
+
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                example_batch: DataProto = deepcopy(batch)
+                # ray_pdb.set_trace()
+
+                uid_array = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                batch.non_tensor_batch["uid"] = uid_array
+                example_batch.non_tensor_batch["uid"] = uid_array.copy()
+
+                problem_texts_raw = self.tokenizer.batch_decode(batch.batch["input_ids"], skip_special_tokens=True)
+                # LOG: `skip_special_tokens=True` means skip special tokens like [CLS], [SEP], [SOS], [EOS], [PAD] and the likes
+                # ray_pdb.set_trace()
+                # Prepare input for example generator #
+                problem_texts = self._format_problem_for_example_generator(problem_texts_raw)
+
+                example_texts = None
+                if self.two_player_enabled:
+                    with marked_timer("example_gen", timing_raw, color="purple"):
+                        example_gen_batch = self._get_gen_batch(example_batch)
+                        # ray_pdb.set_trace()
+                        example_gen_batch.meta_info["global_steps"] = self.global_steps
+                        example_gen_batch = example_gen_batch.repeat(
+                            repeat_times=self.config.two_player.example_actor_rollout_ref.rollout.n, interleave=True
+                        )
+                        example_output = self.example_actor_wg.generate_sequences(example_gen_batch)
+                        # ray_pdb.set_trace()
+                        timing_raw.update(example_output.meta_info.get("timing", {}))
+                        example_output.meta_info.pop("timing", None)
+                    # ray_pdb.set_trace()
+                    example_batch = example_batch.repeat(
+                        repeat_times=self.config.two_player.example_actor_rollout_ref.rollout.n, interleave=True
+                    )
+                    # ray_pdb.set_trace()
+                    example_batch = example_batch.union(example_output)
+                    example_texts = self.example_tokenizer.batch_decode(
+                        example_batch.batch["responses"], skip_special_tokens=True
+                    )
+                    # ray_pdb.set_trace()
+                
+                # Repeat interleave problem_texts
+                problem_texts = self._repeat_texts(problem_texts, self.config.two_player.example_actor_rollout_ref.rollout.n)
+
+                batch = batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    interleave=True,
+                )
+
+                with marked_timer("solution_gen", timing_raw, color="red"):
+                    if self.two_player_enabled:
+                        solution_gen_batch = self._prepare_solution_generation_batch(
+                            batch, example_texts, problem_texts
+                        )
+                        # ray_pdb.set_trace()
+                    else:
+                        solution_gen_batch = self._get_gen_batch(batch)
+                    solution_gen_batch.meta_info["global_steps"] = self.global_steps
+                    solution_output = self.actor_rollout_wg.generate_sequences(solution_gen_batch)
+                    # ray_pdb.set_trace()
+                    timing_raw.update(solution_output.meta_info.get("timing", {}))
+                    solution_output.meta_info.pop("timing", None)
+
+                batch = batch.union(solution_output)
+
+                if "response_mask" not in batch.batch:
+                    batch.batch["response_mask"] = compute_response_mask(batch)
+                if "response_mask" not in example_batch.batch:
+                    example_batch.batch["response_mask"] = compute_response_mask(example_batch)
+
+                if self.config.trainer.balance_batch:
+                    self._balance_batch(batch, metrics=metrics)
+                    self._balance_batch(example_batch, metrics=metrics)
+
+                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                example_batch.meta_info["global_token_num"] = torch.sum(example_batch.batch["attention_mask"], dim=-1).tolist()
+
+                with marked_timer("reward", timing_raw, color="yellow"):
+                    if self.use_rm and "rm_scores" not in batch.batch:
+                        reward_tensor_rm = self.rm_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor_rm)
+
+                    if self.config.reward_model.launch_reward_fn_async:
+                        future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                    else:
+                        reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                # ray_pdb.set_trace()
+                # TODO: CHECK THIS PART ONCE WITH BREAKPOINT #
+                shared_token_level_rewards = self._binary_reward_from_result(reward_tensor, reward_extra_infos_dict)
+                self._apply_rewards(batch, shared_token_level_rewards)
+                self._apply_rewards(example_batch, shared_token_level_rewards)
+                # ray_pdb.set_trace()
+
+                if reward_extra_infos_dict:
+                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                if self.config.algorithm.use_kl_in_reward:
+                    batch, kl_metrics = apply_kl_penalty(
+                        batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                    )
+                    if self.two_player_enabled:
+                        example_batch, kl_metrics_example = apply_kl_penalty(
+                            example_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                        )
+                        metrics.update(kl_metrics_example)
+                    metrics.update(kl_metrics)
+
+                batch = self._compute_actor_old_log_prob(
+                    batch,
+                    self.actor_rollout_wg,
+                    self.config.actor_rollout_ref,
+                    metrics,
+                    prefix="solution_actor",
+                    timing_raw=timing_raw,
+                )
+                example_batch = self._compute_actor_old_log_prob(
+                    example_batch,
+                    self.example_actor_wg,
+                    self.example_actor_cfg,
+                    metrics,
+                    prefix="example_actor",
+                    timing_raw=timing_raw,
+                )
+
+                # ray_pdb.set_trace()
+                if self.use_reference_policy:
+                    with marked_timer("ref", timing_raw, color="olive"):
+                        if not self.ref_in_actor:
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                        else:
+                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
+
+                        if self.two_player_enabled:
+                            assert not self.ref_in_actor, "Reference policy is not supported for example actor"
+                            ref_log_prob_example = self.example_actor_wg.compute_ref_log_prob(example_batch)
+                            example_batch = example_batch.union(ref_log_prob_example)
+                    
+
+                if self.use_critic:
+                    with marked_timer("values", timing_raw, color="cyan"):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+                        example_values = self.critic_wg.compute_values(example_batch)
+                        example_batch = example_batch.union(example_values)
+
+                with marked_timer("adv", timing_raw, color="brown"):
+                    norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+
+                    # LOG: Need `token_level_rewards`` in `batch` to compute this correctly
+                    # LOG: Other things should be handled by the compute_advantage function
+                    # LOG: Grouping is done by 'uid' key in `batch` for GRPO
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        config=self.config.algorithm,
+                    )
+
+                    example_batch = compute_advantage(
+                        example_batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        config=self.config.algorithm,
+                    )
+
+                if self.use_critic:
+                    with marked_timer("update_critic", timing_raw, color="pink"):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    metrics.update(critic_output_metrics)
+
+                if self.config.trainer.critic_warmup <= self.global_steps:
+                    with marked_timer("update_solution_actor", timing_raw, color="red"):
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_output_metrics)
+
+                    with marked_timer("update_example_actor", timing_raw, color="orange"):
+                        example_output = self.example_actor_wg.update_actor(example_batch)
+                    example_actor_metrics = reduce_metrics(example_output.meta_info["metrics"])
+                    for key, value in example_actor_metrics.items():
+                        short_key = key.split("/", 1)[-1] if "/" in key else key
+                        metrics[f"example_actor/{short_key}"] = value
+
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                is_last_step = self.global_steps >= self.total_training_steps
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                ):
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_metrics = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                esi_close_to_expiration = should_save_ckpt_esi(
+                    max_steps_duration=self.max_steps_duration,
+                    redundant_time=self.config.trainer.esi_redundant_time,
+                )
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                ):
+                    if esi_close_to_expiration:
+                        print("Force saving checkpoint: ESI instance expiration approaching.")
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
+
+                if "step" not in timing_raw:
+                    numeric_duration = sum(val for val in timing_raw.values() if isinstance(val, (int, float)))
+                    timing_raw["step"] = numeric_duration
+
+                steps_duration = timing_raw.get("step", 0.0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                        "example_actor/reward_mean": shared_token_level_rewards.mean().item(),
+                    }
+                )
+
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                    self.train_dataloader.sampler.update(batch=batch)
+
+                logger.log(data=metrics, step=self.global_steps)
+
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if (
+                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                ):
+                    self.actor_rollout_wg.dump_memory_snapshot(
+                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                    )
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+                if hasattr(self.train_dataset, "on_batch_end"):
                     self.train_dataset.on_batch_end(batch=batch)
