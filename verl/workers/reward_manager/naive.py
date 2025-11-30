@@ -16,6 +16,7 @@ from collections import defaultdict
 from typing import Any
 
 import torch
+import ray.util.rpdb as ray_pdb
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -92,6 +93,7 @@ class NaiveRewardManager(AbstractRewardManager):
                 ground_truth=ground_truth,
                 extra_info=extra_info,
             )
+            # ray_pdb.set_trace()
 
             if isinstance(score, dict):
                 reward = score["score"]

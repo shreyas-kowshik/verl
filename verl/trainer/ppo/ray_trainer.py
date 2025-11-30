@@ -279,6 +279,8 @@ Structure your response with the following sections:
 	3.	Step-by-Step Solution
 	4.	Final Answer
 
+Generated Solved Example:
+
 """
 
 class RayPPOTrainer:
@@ -815,6 +817,7 @@ class RayPPOTrainer:
         # ray_pdb.set_trace()
         # LOG: Check if the models are initialized correctly from the appropriate paths
         # Access model config details for a particular wg as `example_actor_cls.kwargs['config']['model']['path']`, `solution_actor_cls.kwargs['config']['model']['path']`
+        # ray_pdb.set_trace()
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -1169,7 +1172,9 @@ class RayPPOTrainer:
         template = self.solution_prompt_template or (
             self.default_prompt_template_two_player
         )
-        return template.format(problem=problem_text, example=example_text)
+        extracted_problem_text = problem_text.split("Task:\n")[1].split("\n")[0]
+        processed_problem_text = "Given the following problem statement:\nTask:\n" + extracted_problem_text
+        return template.format(problem=processed_problem_text, example=example_text)
 
     def _tokenize_conditioned_prompts(self, prompts: list[str]) -> dict[str, torch.Tensor]:
         tokenizer_kwargs = {
@@ -1245,7 +1250,7 @@ class RayPPOTrainer:
             )
 
         if reward_vector is None:
-            reward_vector = (reward_tensor.sum(-1) >= reward_tensor.shape[-1]).to(dtype=dtype, device=device)
+            reward_vector = (reward_tensor.sum(-1)).to(dtype=dtype, device=device)
 
         reward_vector = reward_vector.view(batch_size, 1)
         token_level_rewards = reward_vector.repeat(1, reward_tensor.shape[1])
@@ -1278,16 +1283,32 @@ class RayPPOTrainer:
     
     def _process_generated_text_to_tensors(self, generated_text: list[str]) -> dict[str, torch.Tensor]:
         # ray_pdb.set_trace()
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            all_messages = []
+            for idx, text in enumerate(generated_text):
+                messages = [
+                    {"role": "user", "content": text}
+                ]
+                text = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                all_messages.append(text)
+        else:
+            all_messages = generated_text
+        
         model_inputs = self.tokenizer(
-            generated_text, 
+            all_messages, 
             return_tensors="pt", 
             add_special_tokens=False,
             padding="longest",
-            truncation=True,
+            truncation=False,
         )
         # ray_pdb.set_trace()
         input_ids = model_inputs.pop("input_ids")
         attention_mask = model_inputs.pop("attention_mask")
+        # ray_pdb.set_trace()
 
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -1325,7 +1346,7 @@ class RayPPOTrainer:
                 raise ValueError(f"Unknown truncation mode: {truncation_mode!r}")
 
         all_prompt_ids = []
-        for text in generated_text:  # generated_text is a List[str]
+        for text in all_messages:  # generated_text is a List[str]
             raw_ids = self.tokenizer.encode(text, add_special_tokens=False)
             raw_ids = _truncate_ids(raw_ids)
             all_prompt_ids.append(raw_ids)
@@ -1597,6 +1618,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        # print(f"batch.batch['advantages']: {batch.batch['advantages']}")
 
                     # update critic
                     if self.use_critic:
@@ -1773,8 +1795,8 @@ class RayPPOTrainer:
                 # ray_pdb.set_trace()
 
                 uid_array = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                batch.non_tensor_batch["uid"] = uid_array
-                example_batch.non_tensor_batch["uid"] = uid_array.copy()
+                # batch.non_tensor_batch["uid"] = uid_array # LOG: Assign this later on after examples generation
+                example_batch.non_tensor_batch["uid"] = uid_array
 
                 problem_texts_raw = self.tokenizer.batch_decode(batch.batch["input_ids"], skip_special_tokens=True)
                 # Process problem texts raw to get only task
@@ -1790,6 +1812,7 @@ class RayPPOTrainer:
                 # LOG: Update example_batch with the problem_texts and corresponding inputs
                 # model_inputs = self.processor(text=problem_texts, images=None, videos=None, return_tensors="pt")
                 input_ids, attention_mask, position_ids, raw_prompt_ids = self._process_generated_text_to_tensors(problem_texts)
+                # ray_pdb.set_trace()
                 raw_prompt_ids = np.array(raw_prompt_ids, dtype=object)
                 # ray_pdb.set_trace()
 
@@ -1799,6 +1822,7 @@ class RayPPOTrainer:
                 example_batch.batch["position_ids"] = position_ids
                 example_batch.non_tensor_batch["raw_prompt_ids"] = raw_prompt_ids
                 # LOG: All inputs here are (B, max_prompt_length) as rollouts will only be 1 for example generator
+                # ray_pdb.set_trace()
 
                 example_texts = None
                 if self.two_player_enabled:
@@ -1824,9 +1848,24 @@ class RayPPOTrainer:
                     )
                     # ray_pdb.set_trace()
                 # LOG: Seems reasonable and correct until this point!
-                
+                # LOG: `example_batch` statistics
+                # 'input_ids' is (B * example_actor_rollout.n, max_prompt_length), similar for `attntion_mask`, 'prompts'
+                # 'position_ids' is (B * example_actor_rollout.n, max_prompt_length + max_response_length), similar for 'responses'
+                # print(f"example_texts: {example_texts[0]}")
+                # ray_pdb.set_trace()
+
+                # LOG: Until here, example_batch is (B * example_actor_rollout.n, ...), batch is (B, ...)
+                # LOG: Repeat `batch` and assign new uids to it
+                batch = batch.repeat(
+                    repeat_times=self.config.two_player.example_actor_rollout_ref.rollout.n, interleave=True
+                )
+                uid_array = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                batch.non_tensor_batch["uid"] = uid_array # Unique uid for each problem + example pair
+                # ray_pdb.set_trace()
+
                 # Repeat interleave problem_texts
                 problem_texts = self._repeat_texts(problem_texts, self.config.two_player.example_actor_rollout_ref.rollout.n)
+                # ray_pdb.set_trace()
 
                 with marked_timer("solution_gen", timing_raw, color="red"):
                     if self.two_player_enabled:
@@ -1834,8 +1873,10 @@ class RayPPOTrainer:
                             batch, example_texts, problem_texts
                         )
                         # ray_pdb.set_trace()
+                        # ray_pdb.set_trace()
                     else:
                         solution_gen_batch = self._get_gen_batch(batch)
+                    # LOG: `solution_gen_batch` 'input_ids': (B * actor_rollout.n * example_actor_rollout.n, max_prompt_length)
                     
                     solution_gen_batch.meta_info["global_steps"] = self.global_steps
                     solution_gen_batch = solution_gen_batch.repeat(
@@ -1843,9 +1884,15 @@ class RayPPOTrainer:
                     )
 
                     solution_output = self.actor_rollout_wg.generate_sequences(solution_gen_batch)
+                    # LOG: `solution_output` 'responses': (B * actor_rollout.n * example_actor_rollout.n, max_prompt_length + max_response_length)
                     # ray_pdb.set_trace()
                     timing_raw.update(solution_output.meta_info.get("timing", {}))
                     solution_output.meta_info.pop("timing", None)
+
+                # ray_pdb.set_trace()
+                # print(f"solution_output: {solution_output.batch['responses'][0]}")
+                # print(self.tokenizer.batch_decode(solution_output.batch['responses'], skip_special_tokens=True)[-1])
+                # print(self.tokenizer.batch_decode(solution_gen_batch.batch['input_ids'], skip_special_tokens=True)[0])
 
                 batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n,
@@ -1856,7 +1903,12 @@ class RayPPOTrainer:
                 # Repeat example_batch to align with repeated responses in rollout
                 example_batch = example_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                ) # Each repeat here shares the same uid for one problem
+
+                # LOG: For `batch` and `example_batch`, 'input_ids', 'attention_mask', 'position_ids' are of shape (B * actor_rollout.n * example_actor_rollout.n, max_prompt_length + max_response_length)
+
+
+                # ray_pdb.set_trace()
 
                 if "response_mask" not in batch.batch:
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1881,9 +1933,12 @@ class RayPPOTrainer:
                     else:
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                # LOG: `reward_tensor` is (B * actor_rollout.n * example_actor_rollout.n, max_response_length)
                 # ray_pdb.set_trace()
                 # TODO: CHECK THIS PART ONCE WITH BREAKPOINT #
                 shared_token_level_rewards = self._binary_reward_from_result(reward_tensor, reward_extra_infos_dict)
+                # print(f"shared_token_level_rewards: {shared_token_level_rewards}")
+                # ray_pdb.set_trace()
                 self._apply_rewards(batch, shared_token_level_rewards)
                 self._apply_rewards(example_batch, shared_token_level_rewards)
                 # ray_pdb.set_trace()
@@ -1980,12 +2035,12 @@ class RayPPOTrainer:
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    with marked_timer("update_example_actor", timing_raw, color="orange"):
-                        example_output = self.example_actor_wg.update_actor(example_batch)
-                    example_actor_metrics = reduce_metrics(example_output.meta_info["metrics"])
-                    for key, value in example_actor_metrics.items():
-                        short_key = key.split("/", 1)[-1] if "/" in key else key
-                        metrics[f"example_actor/{short_key}"] = value
+                    # with marked_timer("update_example_actor", timing_raw, color="orange"):
+                    #     example_output = self.example_actor_wg.update_actor(example_batch)
+                    # example_actor_metrics = reduce_metrics(example_output.meta_info["metrics"])
+                    # for key, value in example_actor_metrics.items():
+                    #     short_key = key.split("/", 1)[-1] if "/" in key else key
+                    #     metrics[f"example_actor/{short_key}"] = value
 
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                 if rollout_data_dir:

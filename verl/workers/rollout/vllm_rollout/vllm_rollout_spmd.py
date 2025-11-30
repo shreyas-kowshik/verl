@@ -53,6 +53,8 @@ from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
 
+import ray.util.rpdb as ray_pdb
+
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
 except ModuleNotFoundError:
@@ -312,6 +314,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        # ray_pdb.set_trace()
         if not do_sample:
             kwargs = {
                 "best_of": 1,
