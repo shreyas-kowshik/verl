@@ -1237,7 +1237,7 @@ class RayPPOTrainer:
     def _binary_reward_from_result(
         self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict[str, list]
     ) -> torch.Tensor:
-        batch_size = reward_tensor.shape[0]
+        # batch_size = reward_tensor.shape[0]
         device = reward_tensor.device
         dtype = reward_tensor.dtype
         reward_vector = None
@@ -1248,13 +1248,13 @@ class RayPPOTrainer:
                 dtype=dtype,
                 device=device,
             )
-
+        
         if reward_vector is None:
             reward_vector = (reward_tensor.sum(-1)).to(dtype=dtype, device=device)
 
-        reward_vector = reward_vector.view(batch_size, 1)
-        token_level_rewards = reward_vector.repeat(1, reward_tensor.shape[1])
-        return token_level_rewards
+        # reward_vector = reward_vector.view(batch_size, 1)
+        # token_level_rewards = reward_vector.repeat(1, reward_tensor.shape[1])
+        return reward_vector
 
     def _compute_actor_old_log_prob(
         self,
@@ -1277,9 +1277,40 @@ class RayPPOTrainer:
         return actor_batch
 
     @staticmethod
-    def _apply_rewards(actor_batch: DataProto, token_level_rewards: torch.Tensor):
+    def _apply_rewards(actor_batch: DataProto, shared_token_level_rewards: torch.Tensor):
+        # actor_batch.batch["token_level_scores"] = token_level_rewards.clone()
+        # actor_batch.batch["token_level_rewards"] = token_level_rewards.clone()
+        response_mask = actor_batch.batch["response_mask"]
+        B, T = response_mask.shape
+
+        # Make sure mask is boolean
+        mask = response_mask.bool()
+
+        # Find index of last valid token per row
+        # Flip, argmax to get first 1 from the end, then convert back to original index
+        flipped = torch.flip(mask, dims=[1])              # (B, T)
+        last_from_end = torch.argmax(flipped.int(), dim=1)  # (B,)
+        last_idx = T - 1 - last_from_end                  # (B,)
+
+        # Build token-level rewards
+        token_level_rewards = torch.zeros(
+            (B, T),
+            device=response_mask.device,
+            dtype=shared_token_level_rewards.dtype,
+        )
+
+        batch_idx = torch.arange(B, device=response_mask.device)
+        token_level_rewards[batch_idx, last_idx] = shared_token_level_rewards
+
+        # Ensure we don't accidentally put rewards on padded positions
+        token_level_rewards = token_level_rewards * response_mask
+
+        actor_batch.batch["token_level_rewards"] = token_level_rewards
         actor_batch.batch["token_level_scores"] = token_level_rewards.clone()
-        actor_batch.batch["token_level_rewards"] = token_level_rewards.clone()
+
+        return actor_batch
+
+
     
     def _process_generated_text_to_tensors(self, generated_text: list[str]) -> dict[str, torch.Tensor]:
         # ray_pdb.set_trace()
@@ -1439,6 +1470,7 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+                # ray_pdb.set_trace()
 
                 gen_batch = self._get_gen_batch(batch)
                 # LOG: gen_batch.batch.keys()`: _StringKeys(dict_keys(['input_ids', 'attention_mask', 'position_ids']))
@@ -1447,6 +1479,7 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                # ray_pdb.set_trace()
                 # LOG: Each key in gen_batch will now have shape: (B * rollout_n, max_prompt_len)
                 # LOG: gen_batch has all relevant keys needed for generation and reward computation
 
@@ -1512,6 +1545,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    # ray_pdb.set_trace()
                     # LOG: Add back the popped keys when doing `_get_gen_batch(batch)`, includes reward model keys
                     # LOG: These were only removed to give relevant keys to `generate_sequences`
 
@@ -1524,6 +1558,7 @@ class RayPPOTrainer:
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+                    # LOG: `self._balance_batch` reorders the batch so 'uid' value orders can change; however on doing `batch.non_tensor_batch['uid'].sort()` one can recover the original order
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1538,6 +1573,8 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        # LOG: `reward_tensor`: (B * rollout_n, max_response_len), 1 at final token in response if successful rollout/response and 0 everywhere else
+                        # ray_pdb.set_trace()
                     
                     # LOG: `reward_tensor`: (B * rollout_n, max_response_len), for coding, stores 0/1 rewards for each token in response
                     # LOG: `reward_extra_infos_dict`: Empty dict for now, if non-empty, the keys are later added to batch and used in next set of computations (TODO: Check how keys are used)
@@ -1584,6 +1621,8 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        # LOG: `batch.batch["token_level_scores"]`: (B * rollout_n, max_response_len), 1 at final token in response if successful rollout/response and 0 everywhere else
+                        # ray_pdb.set_trace()
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1601,6 +1640,9 @@ class RayPPOTrainer:
                         # This corrects for mismatch between rollout policy and training policy
                         # Also computes mismatch metrics (KL, PPL, etc.)
                         batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
+                        # LOG: `is_metrics`: {}, `batch` is same for normal case, need to set `self.config.algorithm.rollout_is_threshold` to enable IS weights computation
+                        # LOG: `batch.batch["token_level_scores"]`: Same as `batch.batch["token_level_rewards"]` for case when `self.config.algorithm.use_kl_in_reward` is False
+                        # ray_pdb.set_trace()
                         # IS and mismatch metrics already have mismatch/ prefix
                         metrics.update(is_metrics)
 
@@ -1700,6 +1742,9 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # LOG: `critic/score/mean`, `critic/rewards/mean`, `critic/advantages/mean`, `critic/returns/mean`, `critic/values/mean` are computed here
+                # LOG: These values for normal case are simply mean rewards in a batch of (B * rollout_n,) of 0/1 rewards based on successful rollout/response
+                # LOG: Important to keep only the last token with reward 1 in reward_tensor and not give per token +1 rewards for properly computing this
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -1748,6 +1793,8 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
+        # ray_pdb.set_trace()
 
         self.global_steps = 0
         self._load_checkpoint()
@@ -1937,6 +1984,7 @@ class RayPPOTrainer:
                 # ray_pdb.set_trace()
                 # TODO: CHECK THIS PART ONCE WITH BREAKPOINT #
                 shared_token_level_rewards = self._binary_reward_from_result(reward_tensor, reward_extra_infos_dict)
+                # LOG: `shared_token_level_rewards`: (B * actor_rollout.n * example_actor_rollout.n,), 1 if successful rollout/response and 0 everywhere else
                 # print(f"shared_token_level_rewards: {shared_token_level_rewards}")
                 # ray_pdb.set_trace()
                 self._apply_rewards(batch, shared_token_level_rewards)
@@ -2095,7 +2143,7 @@ class RayPPOTrainer:
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
-                        "example_actor/reward_mean": shared_token_level_rewards.mean().item(),
+                        "coding_B_nex_nsol/reward_mean": shared_token_level_rewards.mean().item(),
                     }
                 )
 

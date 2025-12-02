@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+import ray.util.rpdb as ray_pdb
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
@@ -103,9 +104,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    # LOG: `sequence_score`: (B * rollout_n,), sum of token_level_scores for each sequence; For normal case being used currently, it is 1 if successful rollout/response and 0 everywhere else
+    # LOG: `sequence_reward`: (B * rollout_n,), sum of token_level_rewards for each sequence; For normal case being used currently, it is 1 if successful rollout/response and 0 everywhere else
+    # ray_pdb.set_trace()
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
+    # ray_pdb.set_trace()
 
     max_response_length = batch.batch["responses"].shape[-1]
 
@@ -134,6 +139,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+    # ray_pdb.set_trace()
 
     if use_critic:
         values = batch.batch["values"]
