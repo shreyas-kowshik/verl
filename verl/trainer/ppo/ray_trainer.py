@@ -611,6 +611,31 @@ class RayPPOTrainer:
             example_texts = None
             if self.two_player_enabled:
                 example_batch = deepcopy(test_batch)
+                
+                problem_texts_raw = self.tokenizer.batch_decode(test_batch.batch["input_ids"], skip_special_tokens=True)
+                # Process problem texts raw to get only task
+                problem_texts_raw = ["Task:" + s.split("Task:", 1)[1].split("Constraints:", 1)[0] for s in problem_texts_raw]
+                # ray_pdb.set_trace()
+
+                # LOG: `skip_special_tokens=True` means skip special tokens like [CLS], [SEP], [SOS], [EOS], [PAD] and the likes
+                # ray_pdb.set_trace()
+                # Prepare input for example generator #
+                problem_texts = self._format_problem_for_example_generator(problem_texts_raw)
+                # ray_pdb.set_trace()
+
+                # LOG: Update example_batch with the problem_texts and corresponding inputs
+                # model_inputs = self.processor(text=problem_texts, images=None, videos=None, return_tensors="pt")
+                input_ids, attention_mask, position_ids, raw_prompt_ids = self._process_generated_text_to_tensors(problem_texts)
+                # ray_pdb.set_trace()
+                raw_prompt_ids = np.array(raw_prompt_ids, dtype=object)
+                # ray_pdb.set_trace()
+
+                # update example_batch with the input_ids, attention_mask, position_ids, raw_prompt_ids
+                example_batch.batch["input_ids"] = input_ids
+                example_batch.batch["attention_mask"] = attention_mask
+                example_batch.batch["position_ids"] = position_ids
+                example_batch.non_tensor_batch["raw_prompt_ids"] = raw_prompt_ids
+
                 example_gen_batch = self._get_gen_batch(example_batch)
                 example_gen_batch.meta_info = {
                     "eos_token_id": self.example_tokenizer.eos_token_id,
@@ -624,12 +649,12 @@ class RayPPOTrainer:
                 example_texts = self.example_tokenizer.batch_decode(
                     example_output.batch["responses"], skip_special_tokens=True
                 )
+                print("Validation Example Texts 0: ", example_texts[0])
+                print("\n\n\n")
 
             if self.two_player_enabled:
                 test_gen_batch = self._prepare_solution_generation_batch(
-                    batch=test_batch,
-                    example_texts=example_texts,
-                    problem_texts=input_texts,
+                    test_batch, example_texts, problem_texts
                 )
             else:
                 test_gen_batch = self._get_gen_batch(test_batch)
@@ -2083,12 +2108,12 @@ class RayPPOTrainer:
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    # with marked_timer("update_example_actor", timing_raw, color="orange"):
-                    #     example_output = self.example_actor_wg.update_actor(example_batch)
-                    # example_actor_metrics = reduce_metrics(example_output.meta_info["metrics"])
-                    # for key, value in example_actor_metrics.items():
-                    #     short_key = key.split("/", 1)[-1] if "/" in key else key
-                    #     metrics[f"example_actor/{short_key}"] = value
+                    with marked_timer("update_example_actor", timing_raw, color="orange"):
+                        example_output = self.example_actor_wg.update_actor(example_batch)
+                    example_actor_metrics = reduce_metrics(example_output.meta_info["metrics"])
+                    for key, value in example_actor_metrics.items():
+                        short_key = key.split("/", 1)[-1] if "/" in key else key
+                        metrics[f"example_actor/{short_key}"] = value
 
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                 if rollout_data_dir:
