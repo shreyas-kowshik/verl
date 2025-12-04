@@ -44,6 +44,7 @@ async def start_server(config):
     model_config = config.actor_rollout_ref.model
     # create standalone rollout server
     rollout_server_class = get_rollout_replica_class(config.actor_rollout_ref.rollout.name)
+    # LOG: Create a vLLM inference server across replicas/GPUs/nodes to serve LLM inference requests
     rollout_servers = [
         rollout_server_class(
             replica_rank=replica_rank,
@@ -121,6 +122,11 @@ async def generate(
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    # LOG: On a high level, this simply does the following:
+    # 1. Initialize the Ray cluster
+    # 2. Start the vLLM inference server using `start_server`: Serves the LLM
+    # 3. Generate responses for the given dataset using `generate`
+    # 4. Save the results to a parquet file
     ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
